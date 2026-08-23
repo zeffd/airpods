@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+"""airpods -- battery and controls for Apple AirPods on Linux.
+
+Terminal UI by default; --battery / --json / --waybar print once and exit.
+Pure stdlib: curses plus an AF_BLUETOOTH socket. No dependencies, no root.
+
+WHY THIS EXISTS
+    BlueZ exposes nothing for AirPods -- no battery, no settings. They speak
+    neither the GATT Battery Service nor anything bluetoothd surfaces from HFP.
+    So we talk Apple's proprietary AAP/AACP protocol ourselves, over
+    L2CAP PSM 0x1001.
+
+SESSION SETUP
+    connect L2CAP PSM 0x1001
+    -> 00000400 01000200 00000000 00000000   handshake
+    -> 04000400 4d00 ff00000000000000        host capabilities
+    -> 04000400 0f00 ffffffffff              subscribe to notifications
+    Packets are  04 00 04 00 <opcode LE16> <payload>.
+
+BATTERY (opcode 0x0004)
+    <count> then 5 bytes per component: <kind> <?> <level> <status> <?>
+    kind   0x01 single  0x02 right  0x04 left  0x08 case
+    status 0x01 charging  0x02 normal  0x04 disconnected
+    The case reports 0x04 whenever both pods are out of it. That is normal
+    Apple behaviour -- a real case level appears only once a pod is seated.
+
+SETTINGS (opcode 0x0009)
+    <id> <d1> <d2> <d3> <d4>, 11 bytes total.
+    Verified writable on AirPods 4 ANC (A3056, fw 81.2675):
+        0x0D listening mode      0x28 conversational awareness
+        0x26 adaptive volume     0x1B one-bud ANC
+        0x35 sleep detection     0x17 double-press speed
+        0x18 press-and-hold      0x2E adaptive ANC strength
+        0x1F chime volume
+    Silently refused by that firmware:
+        0x25 volume swipe   0x23 volume swipe speed   0x3E uplink EQ
+
+THE ONE REAL GOTCHA
+    A setting change is often NOT echoed in the session that made it. The write
+    lands, but the buds may only report the new value after a reconnect. Do not
+    read a missing echo as a rejection -- an early version of this tool did, and
+    wrongly reported nine writable settings as read-only. So the UI shows your
+    change at once, marks it "…" while awaiting confirmation, downgrades to
+    "unconfirmed" after CONFIRM seconds, and never reverts it. For ground truth,
+    reconnect and read.
+
+    Only one AAP session can exist at a time.
+
+Keys:  j/k or arrows = move    h/l or arrows = adjust    space/enter = toggle
+       r = reconnect           q = quit
+"""
+
+import argparse
+import curses
+import json
+import re
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+
+class AAPError(Exception):
+    pass
+
+
+AAP_UUID = "74ec2172-0bad-4d01-8f77-997b2be0722a"
+PSM = 0x1001
+
+HDR = bytes.fromhex("04000400")
+HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+SET_SPECIFIC_FEATURES = bytes.fromhex("040004004d00ff00000000000000")
+REQ_NOTIFICATIONS = bytes.fromhex("040004000f00ffffffffff")
+
+OP_BATTERY = 0x0004
+OP_EAR = 0x0006
+OP_CONTROL = 0x0009
+OP_DEVINFO = 0x001D
+
+COMPONENT = {0x01: "single", 0x02: "right", 0x04: "left", 0x08: "case"}
+BATT_STATUS = {0x00: "unknown", 0x01: "charging", 0x02: "normal", 0x04: "disconnected"}
+EAR_STATE = {0x00: "in ear", 0x01: "out", 0x02: "in case"}
+
+LISTENING_MODES = [(1, "Off"), (2, "Noise Cancellation"), (3, "Transparency"), (4, "Adaptive")]
+MODE_SHORT = {1: "Off", 2: "ANC", 3: "Transparency", 4: "Adaptive"}
+
+# Setting id -> label. Encoding: 0x01 = enabled, 0x02 = disabled.
+TOGGLES = [
+    (0x28, "Conversational Awareness"),
+    (0x26, "Adaptive Volume"),
+    (0x1B, "One-Bud ANC"),
+    (0x25, "Volume Swipe"),
+    (0x35, "Sleep Detection"),
+    (0x0A, "In-Ear Detection"),
+    (0x34, "Allow 'Off' in Mode Cycle"),
+    (0x31, "In-Case Tone"),
+    (0x12, "Voice Trigger (Siri)"),
+    (0x20, "Connect Automatically"),
+]
+
+# Setting id -> label, value is 0..100.
+SLIDERS = [
+    (0x2E, "Adaptive ANC Strength"),
+    (0x1F, "Chime Volume"),
+    (0x40, "In-Case Tone Volume"),
+]
+
+# Setting id -> label, [(value, name), ...]
+CHOICES = [
+    (0x17, "Double-Press Speed", [(0, "Default"), (1, "Slower"), (2, "Slowest")]),
+    (0x18, "Press-and-Hold Speed", [(0, "Default"), (1, "Slower"), (2, "Slowest")]),
+    (0x23, "Volume Swipe Speed", [(0, "Default"), (1, "Longer"), (2, "Longest")]),
+    (0x01, "Microphone", [(0, "Automatic"), (1, "Right Only"), (2, "Left Only")]),
+    (0x1C, "Crown Rotation", [(1, "Reversed"), (2, "Default")]),
+]
+
+SETTING_NAMES = dict(
+    [(i, l) for i, l in TOGGLES] + [(i, l) for i, l in SLIDERS] +
+    [(i, l) for i, l, _ in CHOICES] +
+    [(0x0D, "Listening Mode"), (0x1A, "Allowed Modes"), (0x24, "Call Management"),
+     (0x3E, "Uplink EQ (Bud)"), (0x3F, "Uplink EQ (Source)"), (0x16, "Press-and-Hold Action")]
+)
+
+
+def _adapters():
+    """Adapter object paths, e.g. ['/org/bluez/hci0']. Never assume hci0 exists."""
+    try:
+        out = subprocess.run(["busctl", "tree", "org.bluez"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ["/org/bluez/hci0"]
+    found = sorted(set(re.findall(r"/org/bluez/hci\d+", out)))
+    return found or ["/org/bluez/hci0"]
+
+
+def find_airpods():
+    """Return (mac, name) for a connected device advertising the AAP UUID.
+
+    Blocking: shells out to bluetoothctl/busctl. Call it off the UI thread.
+    """
+    try:
+        out = subprocess.run(["bluetoothctl", "devices", "Connected"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    adapters = _adapters()
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or parts[0] != "Device":
+            continue
+        mac, name = parts[1], (parts[2] if len(parts) > 2 else "AirPods")
+        for adapter in adapters:
+            path = f"{adapter}/dev_" + mac.replace(":", "_")
+            try:
+                uuids = subprocess.run(
+                    ["busctl", "get-property", "org.bluez", path,
+                     "org.bluez.Device1", "UUIDs"],
+                    capture_output=True, text=True, timeout=5).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if AAP_UUID in uuids:
+                return mac, name
+    return None, None
+
+
+class AAPClient:
+    """Stateful AAP session. Feed it recv() and read .battery/.settings/.ear."""
+
+    def __init__(self, mac, name="AirPods"):
+        self.mac = mac
+        self.name = name
+        self.sock = None
+        self.battery = {}
+        self.settings = {}
+        self.ear = {}
+        self.model = None
+        self.firmware = None
+
+    # -- lifecycle --
+
+    def connect(self, timeout=6.0):
+        s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+        s.settimeout(timeout)
+        try:
+            s.connect((self.mac, PSM))
+            for pkt in (HANDSHAKE, SET_SPECIFIC_FEATURES, REQ_NOTIFICATIONS):
+                s.send(pkt)
+                time.sleep(0.15)
+        except OSError as e:
+            s.close()
+            raise AAPError(str(e)) from e
+        s.setblocking(False)
+        self.sock = s
+        return self
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def fileno(self):
+        return self.sock.fileno() if self.sock else -1
+
+    # -- io --
+
+    def pump(self):
+        """Read all pending packets. Returns True if state changed."""
+        changed = False
+        while True:
+            try:
+                data = self.sock.recv(8192)
+            except BlockingIOError:
+                return changed
+            except OSError as e:
+                raise AAPError(str(e)) from e
+            if not data:
+                raise AAPError("connection closed by device")
+            changed |= self._handle(data)
+
+    def set(self, ident, *values):
+        """Send a control command (opcode 0x09)."""
+        if not self.sock:
+            raise AAPError("not connected")
+        payload = list(values) + [0] * (4 - len(values))
+        pkt = HDR + bytes([OP_CONTROL, 0x00, ident]) + bytes(payload)
+        try:
+            self.sock.send(pkt)
+        except OSError as e:
+            raise AAPError(str(e)) from e
+
+    # -- parsing --
+
+    def _handle(self, data):
+        if not data.startswith(HDR) or len(data) < 6:
+            return False
+        op = int.from_bytes(data[4:6], "little")
+        body = data[6:]
+
+        if op == OP_BATTERY and body:
+            count = body[0]
+            for i in range(count):
+                off = 1 + i * 5
+                if off + 5 > len(body):
+                    break
+                kind, _, level, status, _ = body[off:off + 5]
+                self.battery[COMPONENT.get(kind, "?")] = {
+                    "level": level,
+                    "status": BATT_STATUS.get(status, "unknown"),
+                    "available": status != 0x04,
+                }
+            return True
+
+        if op == OP_CONTROL and len(body) >= 5:
+            self.settings[body[0]] = list(body[1:5])
+            return True
+
+        if op == OP_EAR and len(body) >= 2:
+            self.ear = {"primary": body[0], "secondary": body[1]}
+            return True
+
+        if op == OP_DEVINFO:
+            fields = []
+            for chunk in body.split(b"\x00"):
+                if not chunk:
+                    continue
+                try:
+                    t = chunk.decode("ascii")
+                except UnicodeDecodeError:
+                    continue
+                if t.isprintable() and len(t) >= 3:
+                    fields.append(t)
+            for t in fields:
+                if len(t) == 5 and t[0] == "A" and t[1:].isdigit() and not self.model:
+                    # Each component carries its own model number; keep the first
+                    # so the label stays stable between runs.
+                    self.model = t
+                elif t.count(".") == 2 and t[0].isdigit() and not self.firmware:
+                    self.firmware = t
+            return True
+
+        return False
+
+    # -- convenience --
+
+    @property
+    def mode(self):
+        return self.settings.get(0x0D, [None])[0]
+
+    @property
+    def allowed_modes(self):
+        mask = self.settings.get(0x1A, [0x0F])[0] or 0x0F
+        return [v for v, _ in LISTENING_MODES if mask & (1 << (v - 1))]
+
+    def pod_levels(self):
+        return [r["level"] for k, r in self.battery.items()
+                if r["available"] and k in ("left", "right", "single")]
+
+
+DEBOUNCE = 0.25   # quiet period before a slider change is pushed to the buds
+CONFIRM = 12.0    # buds often echo a change late, or not at all until reconnect
+TWO_BYTE = {0x1F}  # settings the buds report as a pair and expect written as a pair
+
+C_TITLE, C_DIM, C_GOOD, C_WARN, C_BAD, C_SEL, C_ACCENT = range(1, 8)
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_TITLE, curses.COLOR_CYAN, -1)
+    curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+    curses.init_pair(C_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(C_SEL, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, -1)
+
+
+def level_color(pct):
+    return curses.color_pair(C_GOOD) if pct > 50 else (
+        curses.color_pair(C_WARN) if pct > 20 else curses.color_pair(C_BAD))
+
+
+class Row:
+    """One line in the UI. kind drives both rendering and key handling."""
+
+    def __init__(self, kind, label="", ident=None, value=None, options=None):
+        self.kind = kind          # header | text | gap | mode | toggle | slider | choice
+        self.label = label
+        self.ident = ident
+        self.value = value
+        self.options = options or []
+
+    @property
+    def focusable(self):
+        return self.kind in ("mode", "toggle", "slider", "choice")
+
+    @property
+    def key(self):
+        return (self.kind, self.ident)
+
+
+class Tui:
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.client = None
+        self.status = "Looking for AirPods…"
+        self.rows = []
+        self.focus = None        # stable (kind, ident) key, survives row rebuilds
+        self.focus_index = -1
+        self.pending = {}        # ident -> {values, send_at, confirm_by, stale}
+        self.next_retry = 0.0
+        self.dirty = True
+        self.worker = None       # discovery+connect thread; both calls block
+        self.result = None       # (client, error) handed back by that thread
+
+    # ---------- connection ----------
+
+    def _connect_worker(self):
+        """find_airpods() shells out and connect() waits on a socket -- together
+        they block for seconds. Run them here so the UI keeps drawing keys."""
+        try:
+            mac, name = find_airpods()
+            if not mac:
+                self.result = (None, "No connected AirPods found")
+                return
+            self.result = (AAPClient(mac, name).connect(), None)
+        except AAPError as e:
+            self.result = (None, f"Cannot open AAP channel: {e}")
+        except OSError as e:
+            self.result = (None, str(e))
+
+    def ensure_connected(self):
+        if self.client and self.client.sock:
+            return
+
+        if self.worker is not None:
+            if self.worker.is_alive():
+                return
+            self.worker = None
+            client, err = self.result or (None, "connect failed")
+            self.result = None
+            if client:
+                self.client = client
+                self.pending.clear()
+                self.status = None
+            else:
+                self.status = err
+                self.next_retry = time.monotonic() + 4.0
+            self.dirty = True
+            return
+
+        if time.monotonic() < self.next_retry:
+            return
+        self.status = "Looking for AirPods…"
+        self.worker = threading.Thread(target=self._connect_worker, daemon=True)
+        self.worker.start()
+        self.dirty = True
+
+    def drop(self, reason):
+        if self.client:
+            self.client.close()
+        self.client = None
+        self.pending.clear()   # nothing to flush; the socket they targeted is gone
+        self.status = reason
+        self.next_retry = time.monotonic() + 3.0
+        self.dirty = True
+
+    # ---------- model ----------
+
+    def shown(self, ident, fallback):
+        """Optimistic value: what the user just chose, until the buds confirm."""
+        p = self.pending.get(ident)
+        return p["values"][0] if p else fallback
+
+    def build_rows(self):
+        c = self.client
+        rows = []
+        if not c or not c.sock:
+            rows.append(Row("header", self.status or "Disconnected"))
+            self.rows = rows
+            return
+
+        subtitle = " · ".join(x for x in (c.model, c.firmware) if x)
+        rows.append(Row("header", c.name + (f"   {subtitle}" if subtitle else "")))
+        rows.append(Row("gap"))
+
+        for key in ("left", "right", "single", "case"):
+            r = c.battery.get(key)
+            if not r:
+                continue
+            rows.append(Row("text", key, value=r))
+        if c.ear:
+            a = EAR_STATE.get(c.ear["primary"], "?")
+            b = EAR_STATE.get(c.ear["secondary"], "?")
+            rows.append(Row("gap"))
+            rows.append(Row("text", "wearing", value={"text": f"{a} / {b}"}))
+
+        if 0x0D in c.settings:
+            rows.append(Row("gap"))
+            rows.append(Row("header", "LISTENING MODE"))
+            opts = [(v, n) for v, n in LISTENING_MODES if v in c.allowed_modes]
+            rows.append(Row("mode", "Mode", 0x0D, self.shown(0x0D, c.mode), opts))
+
+        toggles = [(i, l) for i, l in TOGGLES if i in c.settings]
+        if toggles:
+            rows.append(Row("gap"))
+            rows.append(Row("header", "TOGGLES"))
+            for ident, label in toggles:
+                rows.append(Row("toggle", label, ident,
+                                self.shown(ident, c.settings[ident][0]) == 0x01))
+
+        sliders = [(i, l) for i, l in SLIDERS if i in c.settings]
+        if sliders:
+            rows.append(Row("gap"))
+            rows.append(Row("header", "LEVELS"))
+            for ident, label in sliders:
+                rows.append(Row("slider", label, ident,
+                                self.shown(ident, c.settings[ident][0])))
+
+        choices = [(i, l, o) for i, l, o in CHOICES if i in c.settings]
+        if choices:
+            rows.append(Row("gap"))
+            rows.append(Row("header", "BEHAVIOUR"))
+            for ident, label, options in choices:
+                rows.append(Row("choice", label, ident,
+                                self.shown(ident, c.settings[ident][0]), options))
+
+        extra = sorted(set(c.settings) - {r.ident for r in rows if r.ident} - {0x1A})
+        if extra:
+            rows.append(Row("gap"))
+            rows.append(Row("header", "OTHER (reported, no control)"))
+            for ident in extra:
+                name = SETTING_NAMES.get(ident, f"Unknown 0x{ident:02X}")
+                vals = list(c.settings[ident])
+                while len(vals) > 1 and vals[-1] == 0:
+                    vals.pop()
+                shown = ", ".join(str(v) for v in vals)
+                rows.append(Row("text", name, value={"text": shown}))
+
+        self.rows = rows
+        self._resolve_focus()
+
+    def _resolve_focus(self):
+        """Re-anchor the cursor onto the row carrying self.focus, else the first
+        focusable row. Row lists are rebuilt constantly; indices are not stable."""
+        self.focus_index = -1
+        if self.focus is not None:
+            for i, r in enumerate(self.rows):
+                if r.focusable and r.key == self.focus:
+                    self.focus_index = i
+                    return
+        for i, r in enumerate(self.rows):
+            if r.focusable:
+                self.focus_index = i
+                self.focus = r.key
+                return
+        self.focus = None
+
+    @property
+    def current(self):
+        if 0 <= self.focus_index < len(self.rows):
+            row = self.rows[self.focus_index]
+            return row if row.focusable else None
+        return None
+
+    def move_cursor(self, step):
+        order = [i for i, r in enumerate(self.rows) if r.focusable]
+        if not order:
+            return False
+        if self.focus_index in order:
+            pos = order.index(self.focus_index)
+        else:
+            pos = 0 if step > 0 else len(order) - 1
+            self.focus_index = order[pos]
+            self.focus = self.rows[self.focus_index].key
+            self.dirty = True
+            return True
+        pos = max(0, min(len(order) - 1, pos + step))
+        self.focus_index = order[pos]
+        self.focus = self.rows[self.focus_index].key
+        self.dirty = True
+        return True
+
+    # ---------- rendering ----------
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 8 or w < 46:
+            try:
+                scr.addstr(0, 0, "terminal too small"[:max(0, w - 1)])
+            except curses.error:
+                pass
+            scr.refresh()
+            return
+
+        width = min(w - 2, 72)
+        top = 0
+        focus_line = 0
+        lines = []
+
+        for i, row in enumerate(self.rows):
+            sel = (i == self.focus_index and row.focusable)
+            if sel:
+                focus_line = len(lines)
+            lines.append((row, sel))
+
+        # simple viewport so long lists still scroll
+        avail = h - 2
+        if len(lines) > avail:
+            top = max(0, min(focus_line - avail // 2, len(lines) - avail))
+        view = lines[top:top + avail]
+
+        for y, (row, sel) in enumerate(view):
+            try:
+                self.draw_row(y, width, row, sel)
+            except curses.error:
+                pass
+
+        hint = " j/k move   h/l adjust   space toggle   r reconnect   q quit "
+        try:
+            scr.addstr(h - 1, 0, hint[:w - 1], curses.color_pair(C_DIM) | curses.A_DIM)
+        except curses.error:
+            pass
+        scr.refresh()
+
+    def _mark(self, ident):
+        p = self.pending.get(ident)
+        if not p:
+            return ""
+        return "  unconfirmed" if p["stale"] else "  …"
+
+    def draw_row(self, y, width, row, sel):
+        scr = self.scr
+        if row.kind == "gap":
+            return
+        if row.kind == "header":
+            scr.addstr(y, 1, row.label[:width], curses.color_pair(C_TITLE) | curses.A_BOLD)
+            return
+
+        if row.kind == "text":
+            v = row.value or {}
+            if "text" in v:
+                label = row.label if any(ch.isupper() for ch in row.label) \
+                    else row.label.capitalize()
+                scr.addstr(y, 3, f"{label:<22}", curses.color_pair(C_DIM))
+                scr.addstr(v["text"][:width - 26], curses.color_pair(C_ACCENT))
+                return
+            # battery row
+            label = row.label.capitalize()
+            scr.addstr(y, 3, f"{label:<8}", curses.color_pair(C_DIM) | curses.A_BOLD)
+            if not v.get("available"):
+                scr.addstr("─" * 20 + "   —", curses.color_pair(C_DIM) | curses.A_DIM)
+                return
+            pct = v["level"]
+            filled = round(pct / 5)
+            attr = level_color(pct)
+            scr.addstr("█" * filled, attr)
+            scr.addstr("░" * (20 - filled), curses.color_pair(C_DIM) | curses.A_DIM)
+            mark = " ⚡" if v["status"] == "charging" else ""
+            scr.addstr(f"  {pct:3d}%{mark}", attr | curses.A_BOLD)
+            return
+
+        marker = "▸ " if sel else "  "
+        base = curses.color_pair(C_SEL) if sel else curses.color_pair(C_DIM)
+        scr.addstr(y, 1, marker, curses.color_pair(C_ACCENT) | curses.A_BOLD)
+
+        if row.kind == "mode":
+            scr.addstr(f"{row.label:<20}", base)
+            for value, name in row.options:
+                on = value == row.value
+                short = MODE_SHORT.get(value, name)
+                a = curses.color_pair(C_GOOD) | curses.A_BOLD if on \
+                    else curses.color_pair(C_DIM) | curses.A_DIM
+                scr.addstr(f"{'●' if on else '○'} {short}   ", a)
+            scr.addstr(self._mark(row.ident), curses.color_pair(C_WARN))
+            return
+
+        if row.kind == "toggle":
+            box = "[✓]" if row.value else "[ ]"
+            attr = curses.color_pair(C_GOOD) if row.value else curses.color_pair(C_DIM)
+            scr.addstr(f"{box} ", attr | curses.A_BOLD)
+            scr.addstr(f"{row.label}", base)
+            scr.addstr(self._mark(row.ident), curses.color_pair(C_WARN))
+            return
+
+        if row.kind == "slider":
+            scr.addstr(f"{row.label:<24}", base)
+            filled = round(row.value / 5)
+            scr.addstr("▓" * filled, curses.color_pair(C_ACCENT))
+            scr.addstr("░" * (20 - filled), curses.color_pair(C_DIM) | curses.A_DIM)
+            scr.addstr(f" {row.value:3d}", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+            scr.addstr(self._mark(row.ident), curses.color_pair(C_WARN))
+            return
+
+        if row.kind == "choice":
+            name = dict(row.options).get(row.value, f"0x{row.value:02X}")
+            scr.addstr(f"{row.label:<24}", base)
+            scr.addstr(f"< {name} >", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+            scr.addstr(self._mark(row.ident), curses.color_pair(C_WARN))
+            return
+
+    # ---------- input ----------
+
+    def handle_key(self, ch):
+        if ch in (ord("q"), 27):
+            return False
+        if ch in (ord("j"), curses.KEY_DOWN):
+            self.move_cursor(1)
+        elif ch in (ord("k"), curses.KEY_UP):
+            self.move_cursor(-1)
+        elif ch == ord("r"):
+            self.drop("Reconnecting…")
+            self.next_retry = 0
+        elif ch == curses.KEY_RESIZE:
+            self.dirty = True
+        else:
+            row = self.current
+            if row is not None:
+                self.act(row, ch)
+        return True
+
+    def act(self, row, ch):
+        if not row.focusable or not self.client:
+            return
+        left = ch in (ord("h"), curses.KEY_LEFT)
+        right = ch in (ord("l"), curses.KEY_RIGHT)
+        pick = ch in (ord(" "), 10, 13, curses.KEY_ENTER)
+
+        if row.kind == "toggle" and (pick or left or right):
+            self.change(row.ident, [0x02 if row.value else 0x01])
+        elif row.kind == "mode":
+            values = [v for v, _ in row.options]
+            if not values:
+                return
+            try:
+                i = values.index(row.value)
+            except ValueError:
+                i = 0
+            if right or pick:
+                i = (i + 1) % len(values)
+            elif left:
+                i = (i - 1) % len(values)
+            else:
+                return
+            self.change(row.ident, [values[i]])
+        elif row.kind == "choice":
+            values = [v for v, _ in row.options]
+            try:
+                i = values.index(row.value)
+            except ValueError:
+                i = 0
+            if right or pick:
+                i = (i + 1) % len(values)
+            elif left:
+                i = (i - 1) % len(values)
+            else:
+                return
+            self.change(row.ident, [values[i]])
+        elif row.kind == "slider":
+            step = 5 if (left or right) else 0
+            if not step:
+                return
+            new = row.value + (step if right else -step)
+            new = max(0, min(100, new))
+            self.change(row.ident, [new], debounce=DEBOUNCE)
+
+    def push(self, ident, *values):
+        if not self.client:
+            return
+        try:
+            self.client.set(ident, *values)
+        except AAPError as e:
+            self.drop(f"Write failed: {e}")
+
+    def change(self, ident, values, debounce=0.0):
+        values = list(values)
+        if ident in TWO_BYTE and len(values) == 1:
+            values = [values[0], values[0]]
+        self.pending[ident] = {"values": values,
+                               "send_at": time.monotonic() + debounce,
+                               "confirm_by": None,
+                               "stale": False}
+        self.dirty = True
+
+    def flush_pending(self):
+        now = time.monotonic()
+        for ident, p in list(self.pending.items()):
+            if p["confirm_by"] is None:
+                if now >= p["send_at"]:
+                    self.push(ident, *p["values"])
+                    p["confirm_by"] = now + CONFIRM
+            elif not p["stale"] and now >= p["confirm_by"]:
+                p["stale"] = True
+                self.dirty = True
+
+    def reconcile(self):
+        """Clear pending edits the buds have now confirmed."""
+        if not self.client:
+            return
+        for ident, p in list(self.pending.items()):
+            cur = self.client.settings.get(ident)
+            if cur and all(cur[i] == v for i, v in enumerate(p["values"])):
+                del self.pending[ident]
+                self.dirty = True
+
+    # ---------- main loop ----------
+
+    def run(self):
+        self.scr.nodelay(True)
+        curses.curs_set(0)
+        while True:
+            self.ensure_connected()
+
+            fds = [sys.stdin]
+            if self.client and self.client.sock:
+                fds.append(self.client.fileno())
+            try:
+                ready, _, _ = select.select(fds, [], [], 0.12)
+            except (OSError, ValueError):
+                ready = []
+
+            if self.client and self.client.sock and self.client.fileno() in [
+                    f if isinstance(f, int) else f.fileno() for f in ready]:
+                try:
+                    if self.client.pump():
+                        self.reconcile()
+                        self.dirty = True
+                except AAPError as e:
+                    self.drop(f"Disconnected: {e}")
+
+            self.build_rows()
+
+            while True:
+                ch = self.scr.getch()
+                if ch == -1:
+                    break
+                self.dirty = True
+                if not self.handle_key(ch):
+                    return
+                self.build_rows()
+
+            self.flush_pending()
+            if self.dirty:
+                self.build_rows()
+                self.draw()
+                self.dirty = False
+
+# ---------------------------------------------------------------- one-shot ---
+
+ORDER = ("left", "right", "single", "case")
+SHORT = {"left": "L", "right": "R", "case": "C", "single": ""}
+
+
+def fmt_plain(c):
+    bits = []
+    for key in ORDER:
+        r = c.battery.get(key)
+        if not r:
+            continue
+        if not r["available"]:
+            bits.append(f"{key.capitalize()}: --")
+        else:
+            mark = " (charging)" if r["status"] == "charging" else ""
+            bits.append(f"{key.capitalize()}: {r['level']}%{mark}")
+    return f"{c.name}  " + "  ".join(bits)
+
+
+def fmt_waybar(c):
+    text = " ".join(f"{SHORT.get(k, k)}{r['level']}%"
+                    for k in ORDER if (r := c.battery.get(k)) and r["available"]) or "--"
+    levels = c.pod_levels()
+    return json.dumps({
+        "text": text,
+        "tooltip": fmt_plain(c),
+        "percentage": min(levels) if levels else 0,
+        "class": "charging" if any(r["status"] == "charging"
+                                   for r in c.battery.values()) else "normal",
+    })
+
+
+def one_shot(args):
+    """Print battery once (or stream with --watch) and exit."""
+    def fail(msg):
+        if args.waybar:
+            print(json.dumps({"text": "", "tooltip": msg}))
+            return 0
+        print(msg, file=sys.stderr)
+        return 1
+
+    mac, name = (args.mac, "AirPods") if args.mac else find_airpods()
+    if not mac:
+        return fail("no connected AirPods found")
+    try:
+        c = AAPClient(mac, name).connect()
+    except AAPError as e:
+        return fail(f"cannot open AAP channel to {mac}: {e}")
+
+    deadline = time.time() + args.timeout
+    try:
+        while True:
+            if not args.watch and time.time() > deadline:
+                return fail("timed out waiting for a battery report")
+            r, _, _ = select.select([c.fileno()], [], [], 0.3)
+            if not r:
+                continue
+            try:
+                changed = c.pump()
+            except AAPError as e:
+                return fail(f"connection lost: {e}")
+            if not changed or not c.battery:
+                continue
+            if args.json:
+                print(json.dumps({"device": c.name, "mac": c.mac,
+                                  "model": c.model, "battery": c.battery}))
+            elif args.waybar:
+                print(fmt_waybar(c))
+            else:
+                print(fmt_plain(c))
+            sys.stdout.flush()
+            if not args.watch:
+                return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        c.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="airpods",
+        description="Battery and controls for AirPods. Runs the TUI when given no flags.")
+    ap.add_argument("--battery", action="store_true", help="print battery once and exit")
+    ap.add_argument("--json", action="store_true", help="one-shot, as JSON")
+    ap.add_argument("--waybar", action="store_true", help="one-shot, waybar JSON module")
+    ap.add_argument("--watch", action="store_true", help="with the above, stream updates")
+    ap.add_argument("--mac", help="AirPods MAC (default: autodetect)")
+    ap.add_argument("--timeout", type=float, default=8.0,
+                help="seconds to wait for a battery report (default: 8)")
+    args = ap.parse_args()
+
+    if args.battery or args.json or args.waybar:
+        return one_shot(args)
+
+    try:
+        curses.wrapper(lambda scr: (init_colors(), Tui(scr).run()))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
