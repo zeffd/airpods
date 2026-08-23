@@ -38,7 +38,7 @@ No root. No kernel patches. No `Experimental = true`.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/airpods.git
+git clone https://github.com/zeffd/airpods.git
 cd airpods
 ./install.sh              # -> ~/.local/bin/airpods
 ```
