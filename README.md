@@ -23,10 +23,9 @@ No root. No kernel patches. No `Experimental = true`.
 
  TOGGLES
    [ ] Conversational Awareness
-   [ ] Adaptive Volume
    [ ] One-Bud ANC
    [✓] Volume Swipe
-   [ ] Sleep Detection
+   [✓] Pause media when either pod is removed
 
  LEVELS
    Adaptive ANC Strength   ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░  50
@@ -65,6 +64,15 @@ airpods --watch      # stream updates; combines with the above
 The menu is generated from whatever your buds actually advertise, so it shows
 only controls that exist on your model.
 
+The TUI also has a local **Pause media when either pod is removed** switch.
+When enabled, it pauses the active MPRIS player on the next in-ear to out-of-ear
+transition, then resumes that same player when both pods are back in. It only
+resumes media that this app paused, so it will not start something that was
+already paused. Resume waits 1.5 seconds so the buds can restore ANC first.
+This optional feature uses `playerctl`; install it with
+`pacman -S playerctl` on Arch. The preference is saved in `$XDG_CONFIG_HOME/airpods/preferences.json`
+(or `~/.config/airpods/preferences.json`).
+
 **Only one AAP session can exist at a time.** The TUI holds it, so one-shot
 invocations will fail while it is running.
 
@@ -96,9 +104,8 @@ behaviour, not a failure — a real case level appears only once a pod is seated
 **Settings** (opcode `0x0009`) — `<id> <d1> <d2> <d3> <d4>`, 11 bytes total.
 Verified writable on this hardware: `0x0D` listening mode, `0x28` conversational
 awareness, `0x26` adaptive volume, `0x1B` one-bud ANC, `0x35` sleep detection,
-`0x17` double-press speed, `0x18` press-and-hold speed, `0x2E` adaptive ANC
-strength, `0x1F` chime volume. Silently refused by this firmware: `0x25` volume
-swipe, `0x23` volume swipe speed, `0x3E` uplink EQ.
+`0x2E` adaptive ANC strength, `0x1F` chime volume. Silently refused by this
+firmware: `0x25` volume swipe, `0x23` volume swipe speed.
 
 ### The one real gotcha
 
